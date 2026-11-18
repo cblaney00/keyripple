@@ -22,11 +22,14 @@ import time
 import evdev
 from evdev import ecodes
 from openrgb import OpenRGBClient
-from openrgb.utils import DeviceType, RGBColor
+from openrgb.utils import DeviceType, PacketType, RGBColor
 
 HOST = os.environ.get("KEYRIPPLE_HOST", "127.0.0.1")
 PORT = int(os.environ.get("KEYRIPPLE_PORT", "6742"))
 NAME = os.environ.get("KEYRIPPLE_DEVICE", "G915")
+
+
+HOLD = float(os.environ.get("KEYRIPPLE_HOLD", "5"))  # seconds between re-taking the lights
 
 
 def hexcolor(name, default):
@@ -126,6 +129,15 @@ for code, name in {
         KEYNAME[c] = name
 
 
+def hold_direct(dev):
+    """Put the keyboard back in Direct mode. Like dev.set_mode("Direct") but without
+    re-reading the whole device afterwards, which the G915 is too slow for."""
+    mode = next(m for m in dev.modes if m.name == "Direct")
+    data = mode.pack(dev.comms._protocol_version)
+    dev.comms.send_header(dev.id, PacketType.RGBCONTROLLER_UPDATEMODE, len(data))
+    dev.comms.send_data(data)
+
+
 def find_keyboards():
     """The G915's typing input devices (not its mouse/consumer-control nodes)."""
     found = {}
@@ -135,7 +147,10 @@ def find_keyboards():
         except OSError:
             continue
         keys = d.capabilities().get(ecodes.EV_KEY, [])
-        if NAME.lower() in d.name.lower() and ecodes.KEY_A in keys:
+        # Through its Lightspeed receiver (046d:c547) the keyboard is sometimes only
+        # called "Logitech USB Receiver Keyboard", depending on which driver took it.
+        receiver = (d.info.vendor, d.info.product) == (0x046D, 0xC547)
+        if (NAME.lower() in d.name.lower() or receiver) and ecodes.KEY_A in keys:
             found[d.fd] = d
         else:
             d.close()
@@ -189,9 +204,17 @@ def main():
         print("keyboards", [d.name for d in kbds.values()], "leds", [len(p) for _, p in rgb], flush=True)
     ripples = []
     last_scan = time.monotonic()
+    last_hold = time.monotonic()
     active = False
     while True:
         now = time.monotonic()
+        # The G915 drops back to its own built-in rainbow when it naps, wakes or
+        # reconnects, and never says so. Take the lights back every few seconds.
+        if not ripples and now - last_hold > HOLD:
+            for dev, _ in rgb:
+                hold_direct(dev)
+            paint([], now)
+            last_hold = now
         if now - last_scan > 3:
             for d in kbds.values():
                 d.close()
